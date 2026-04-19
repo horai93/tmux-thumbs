@@ -42,6 +42,8 @@ impl Executor for RealShell {
 }
 
 const TMP_FILE: &str = "/tmp/thumbs-last";
+const THUMBS_WINDOW_NAME: &str = "[thumbs]";
+const WINDOW_LIST_FORMAT: &str = "#{window_id}\t#{window_name}";
 
 #[allow(dead_code)]
 fn dbg(msg: &str) {
@@ -67,6 +69,7 @@ pub struct Swapper<'a> {
   active_pane_scroll_position: Option<i32>,
   active_pane_zoomed: Option<bool>,
   thumbs_pane_id: Option<String>,
+  thumbs_window_id: Option<String>,
   content: Option<String>,
   signal: String,
 }
@@ -79,7 +82,7 @@ impl<'a> Swapper<'a> {
     upcase_command: String,
     multi_command: String,
     osc52: bool,
-  ) -> Swapper {
+  ) -> Swapper<'a> {
     let since_the_epoch = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .expect("Time went backwards");
@@ -97,9 +100,23 @@ impl<'a> Swapper<'a> {
       active_pane_scroll_position: None,
       active_pane_zoomed: None,
       thumbs_pane_id: None,
+      thumbs_window_id: None,
       content: None,
       signal,
     }
+  }
+
+  pub fn run(&mut self) {
+    self.capture_active_pane();
+    self.cleanup_stale_thumbs_windows();
+    self.execute_thumbs();
+    self.swap_panes();
+    self.resize_pane();
+    self.wait_thumbs();
+    self.cleanup_thumbs_window();
+    self.retrieve_content();
+    self.destroy_content();
+    self.execute_command();
   }
 
   pub fn capture_active_pane(&mut self) {
@@ -147,6 +164,20 @@ impl<'a> Swapper<'a> {
     let zoomed_pane = *active_pane.get(4).expect("Unable to retrieve zoom pane property") == "1";
 
     self.active_pane_zoomed = Some(zoomed_pane);
+  }
+
+  pub fn cleanup_stale_thumbs_windows(&mut self) {
+    let list_windows_command = vec!["tmux", "list-windows", "-a", "-F", WINDOW_LIST_FORMAT];
+    let params: Vec<String> = list_windows_command.iter().map(|arg| arg.to_string()).collect();
+    let output = self.executor.execute(params);
+
+    for line in output.lines() {
+      if let Some((window_id, window_name)) = line.split_once('\t') {
+        if window_name == THUMBS_WINDOW_NAME {
+          self.kill_window(window_id);
+        }
+      }
+    }
   }
 
   pub fn execute_thumbs(&mut self) {
@@ -231,16 +262,22 @@ impl<'a> Swapper<'a> {
       "new-window",
       "-P",
       "-F",
-      "#{pane_id}",
+      "#{window_id}\t#{pane_id}",
       "-d",
       "-n",
-      "[thumbs]",
+      THUMBS_WINDOW_NAME,
       pane_command.as_str(),
     ];
 
     let params: Vec<String> = thumbs_command.iter().map(|arg| arg.to_string()).collect();
+    let output = self.executor.execute(params);
 
-    self.thumbs_pane_id = Some(self.executor.execute(params));
+    let (window_id, pane_id) = output
+      .split_once('\t')
+      .expect("Unable to retrieve thumbs window and pane ids");
+
+    self.thumbs_window_id = Some(window_id.to_string());
+    self.thumbs_pane_id = Some(pane_id.to_string());
   }
 
   pub fn swap_panes(&mut self) {
@@ -290,6 +327,18 @@ impl<'a> Swapper<'a> {
     let wait_command = vec!["tmux", "wait-for", self.signal.as_str()];
     let params = wait_command.iter().map(|arg| arg.to_string()).collect();
 
+    self.executor.execute(params);
+  }
+
+  pub fn cleanup_thumbs_window(&mut self) {
+    if let Some(thumbs_window_id) = self.thumbs_window_id.take() {
+      self.kill_window(&thumbs_window_id);
+    }
+  }
+
+  fn kill_window(&mut self, target: &str) {
+    let kill_window_command = vec!["tmux", "kill-window", "-t", target];
+    let params = kill_window_command.iter().map(|arg| arg.to_string()).collect();
     self.executor.execute(params);
   }
 
@@ -418,26 +467,37 @@ mod tests {
   struct TestShell {
     outputs: Vec<String>,
     executed: Option<Vec<String>>,
+    history: Vec<Vec<String>>,
   }
 
   impl TestShell {
     fn new(outputs: Vec<String>) -> TestShell {
       TestShell {
         executed: None,
+        history: vec![],
         outputs,
       }
+    }
+
+    fn history(&self) -> &Vec<Vec<String>> {
+      &self.history
     }
   }
 
   impl Executor for TestShell {
     fn execute(&mut self, args: Vec<String>) -> String {
-      self.executed = Some(args);
+      self.executed = Some(args.clone());
+      self.history.push(args);
       self.outputs.pop().unwrap()
     }
 
     fn last_executed(&self) -> Option<Vec<String>> {
       self.executed.clone()
     }
+  }
+
+  fn command(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_string()).collect()
   }
 
   #[test]
@@ -462,7 +522,7 @@ mod tests {
   fn swap_panes() {
     let last_command_outputs = vec![
       "".to_string(),
-      "%100".to_string(),
+      "@11\t%100".to_string(),
       "".to_string(),
       "%106:100:24:1:0:nope\n%98:100:24:1:0:active\n%107:100:24:1:0:nope\n".to_string(),
     ];
@@ -483,6 +543,58 @@ mod tests {
     let expectation = vec!["tmux", "swap-pane", "-d", "-s", "%98", "-t", "%100"];
 
     assert_eq!(executor.last_executed().unwrap(), expectation);
+  }
+
+  #[test]
+  fn cleanup_stale_thumbs_windows_kills_named_windows() {
+    let last_command_outputs = vec![
+      "".to_string(),
+      "".to_string(),
+      "@1\tmain\n@2\t[thumbs]\n@3\tlogs\n@4\t[thumbs]\n".to_string(),
+    ];
+    let mut executor = TestShell::new(last_command_outputs);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    swapper.cleanup_stale_thumbs_windows();
+
+    assert_eq!(
+      executor.history(),
+      &vec![
+        command(&["tmux", "list-windows", "-a", "-F", WINDOW_LIST_FORMAT]),
+        command(&["tmux", "kill-window", "-t", "@2"]),
+        command(&["tmux", "kill-window", "-t", "@4"]),
+      ]
+    );
+  }
+
+  #[test]
+  fn cleanup_thumbs_window_kills_captured_window_id() {
+    let mut executor = TestShell::new(vec!["".to_string()]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    swapper.thumbs_window_id = Some("@11".to_string());
+
+    swapper.cleanup_thumbs_window();
+    let cleared = swapper.thumbs_window_id.is_none();
+
+    assert!(cleared);
+    assert_eq!(
+      executor.last_executed().unwrap(),
+      command(&["tmux", "kill-window", "-t", "@11"])
+    );
   }
 
   #[test]
@@ -587,14 +699,7 @@ fn main() -> std::io::Result<()> {
     osc52,
   );
 
-  swapper.capture_active_pane();
-  swapper.execute_thumbs();
-  swapper.swap_panes();
-  swapper.resize_pane();
-  swapper.wait_thumbs();
-  swapper.retrieve_content();
-  swapper.destroy_content();
-  swapper.execute_command();
+  swapper.run();
 
   Ok(())
 }
